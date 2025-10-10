@@ -1,10 +1,11 @@
 from pathlib import Path
 import pathlib
 from tqdm import tqdm
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import json
-from torchvision.datasets.utils import _get_google_drive_file_id, extract_archive
-from torchvision.datasets.utils import download_file_from_google_drive
+import os
+import shutil
+from torchvision.datasets.utils import download_url, extract_archive
 from torchvision.io.video import read_video
 import av
 
@@ -13,7 +14,7 @@ import pytube
 from pytube import YouTube
 
 
-from urllib.request import HTTPError
+from urllib.request import HTTPError, Request, urlopen
 from urllib.error import URLError
 from socket import gaierror
 from http.client import IncompleteRead
@@ -86,25 +87,58 @@ class MSRVTTDataset():
         # paths, captions, ids, start_times, end_times = zip(*test_data)
 
     '''
-    def __init__(self, root_folder:pathlib.Path = None) -> None:
+    def __init__(self, root_folder: Optional[pathlib.Path] = None) -> None:
 
         # name of the dataset.
         self.name = "MSRVTT"
 
-        # url links for the dataset train videos in zip format.
-        self.train_path = ["https://drive.google.com/file/d/1XyZwkCGV2zF90jjfmkqVlWvWUVWqCr66", "train_val_videos.zip"]
+        env = os.getenv
+        self.train_video_sources = [
+            (env('MSRVTT_TRAIN_ARCHIVE_URL'), 'train_val_videos.zip'),
+            ('https://huggingface.co/datasets/RangiLyu/MSRVTT/resolve/main/train_val_videos.zip?download=1', 'train_val_videos.zip'),
+            ('https://huggingface.co/datasets/dqa/MSRVTT/resolve/main/train_val_videos.zip?download=1', 'train_val_videos.zip'),
+            ('https://www.robots.ox.ac.uk/~maxbain/frozen-in-time/data/msrvtt_train_val_videos.zip', 'msrvtt_train_val_videos.zip'),
+        ]
 
-        # url links for the dataset val videos in zip format.
-        self.test_path = ["https://drive.google.com/file/d/17Q4Cq-QwO9ygjbVV9OBeJqGks2DwtltH", "test_videos.zip"]
+        self.test_video_sources = [
+            (env('MSRVTT_TEST_ARCHIVE_URL'), 'test_videos.zip'),
+            ('https://huggingface.co/datasets/RangiLyu/MSRVTT/resolve/main/test_videos.zip?download=1', 'test_videos.zip'),
+            ('https://huggingface.co/datasets/dqa/MSRVTT/resolve/main/test_videos.zip?download=1', 'test_videos.zip'),
+            ('https://www.robots.ox.ac.uk/~maxbain/frozen-in-time/data/msrvtt_test_videos.zip', 'msrvtt_test_videos.zip'),
+        ]
 
-        # url links for the dataset annotations in zip format.
-        self.train_annotations_path = ["https://drive.google.com/file/d/1mglvNKhJ-igKiQFFk8RJfw9A8Xp1vLM6", "train_val_annotation.zip"]
+        self.video_archive_repo = env('MSRVTT_ARCHIVE_REPO', 'RangiLyu/MSRVTT')
 
-        # url links for the dataset annotations in zip format.
-        self.test_annotations_path = ["https://drive.google.com/file/d/16iaSq_qi3ve3coqZHokcWJCvIEv6AcH3", "test_annotation.zip"]
+        self.annotation_sources = {
+            'train': [
+                env('MSRVTT_TRAIN_ANN_URL'),
+                'https://dl.fbaipublicfiles.com/pvse/msrvtt/train_val_videodatainfo.json',
+                'https://www.robots.ox.ac.uk/~maxbain/frozen-in-time/data/train_val_videodatainfo.json',
+                'https://raw.githubusercontent.com/yalesong/pvse/master/data/MSRVTT/train_val_videodatainfo.json',
+                'https://huggingface.co/datasets/RangiLyu/MSRVTT/resolve/main/train_val_videodatainfo.json?download=1',
+                'https://huggingface.co/datasets/dqa/MSRVTT/resolve/main/train_val_videodatainfo.json?download=1',
+            ],
+            'test': [
+                env('MSRVTT_TEST_ANN_URL'),
+                'https://dl.fbaipublicfiles.com/pvse/msrvtt/test_videodatainfo.json',
+                'https://www.robots.ox.ac.uk/~maxbain/frozen-in-time/data/test_videodatainfo.json',
+                'https://raw.githubusercontent.com/yalesong/pvse/master/data/MSRVTT/test_videodatainfo.json',
+                'https://huggingface.co/datasets/RangiLyu/MSRVTT/resolve/main/test_videodatainfo.json?download=1',
+                'https://huggingface.co/datasets/dqa/MSRVTT/resolve/main/test_videodatainfo.json?download=1',
+            ],
+        }
+
+        ann_repo_overrides = env('MSRVTT_ANN_HF_REPOS', '')
+        self.annotation_hf_repos = [repo.strip() for repo in ann_repo_overrides.split(',') if repo and repo.strip()]
+        if self.video_archive_repo and self.video_archive_repo not in self.annotation_hf_repos:
+            self.annotation_hf_repos.append(self.video_archive_repo)
+        for default_repo in ['dqa/MSRVTT']:
+            if default_repo not in self.annotation_hf_repos:
+                self.annotation_hf_repos.append(default_repo)
 
         # Project root Path
-        self.root_folder = Path('/media/envisage/backup1/Murat/Datasets')
+        default_root = Path(os.getenv('MSRVTT_ROOT', '/Volumes/KINGSTON/dataset'))
+        self.root_folder = Path(root_folder) if root_folder else default_root
 
         # Drive Path
         self.dataset_folder = self.root_folder / self.name
@@ -192,30 +226,243 @@ class MSRVTTDataset():
         }
 
     def download_annotations(self) -> None:
-        '''
-            Download the dataset's train videos, test videos and their annotations into the MSRVTT folder.
-        '''
+        """Download MSRVTT annotation JSON files via direct links."""
 
-        # dataset paths in a list for downloading from google drive.
-        # download_list = [self.train_path, self.test_path, self.train_annotations_path, self.test_annotations_path]
-        download_list = [self.train_annotations_path, self.test_annotations_path]
-        save_list = [self.default_train_annotations, self.default_test_annotations]
+        targets = [
+            ('train', self.default_train_annotations, 'train_val_videodatainfo.json'),
+            ('test', self.default_test_annotations, 'test_videodatainfo.json'),
+        ]
 
-        for download_path, save_path in zip(download_list, save_list):
-            # check if the annotation file is already downloaded. if true do not download it again and continue.
-            if save_path.exists():
-                print(f'{save_path.name} already exists.')
+        for split, destination, filename in targets:
+            if destination.exists():
+                print(f"{destination.name} already exists.")
                 continue
-            # check if the dataset folder exists if not create it.
-            if not self.dataset_folder.exists():
-                Path(self.dataset_folder).mkdir(parents=True, exist_ok=True)
-            
-            # download_and_extract_archive(url=path, download_root=str(self.drive_data_zip_paths), extract_root=str(self.dataset_folder))
-            file_id = _get_google_drive_file_id(download_path[0])
-            file = self.dataset_folder / download_path[1]
-            download_file_from_google_drive(file_id=file_id, root=str(self.dataset_folder), filename=download_path[1])
-            extract_archive(str(file), str(self.dataset_folder))
-            file.unlink()
+            if not destination.parent.exists():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+
+            local_env_key = f"MSRVTT_{split.upper()}_ANN_PATH"
+            if self._copy_local_annotation(os.getenv(local_env_key), filename, destination):
+                continue
+
+            if self._copy_local_annotation(os.getenv('MSRVTT_ANN_DIR'), filename, destination):
+                continue
+
+            candidates = [url for url in self.annotation_sources.get(split, []) if url]
+            success = False
+            for url in candidates:
+                try:
+                    print(f"Downloading {split} annotations from {url}...")
+                    self._download_to_path(url, destination)
+                except Exception as exc:
+                    print(f"Failed to download {split} annotations from {url}: {exc}")
+                    continue
+                else:
+                    success = True
+                    break
+            if not success:
+                success = self._download_annotations_from_hf(split, filename, destination)
+            if not success:
+                raise RuntimeError(
+                    f"Unable to download {split} annotations. "
+                    f"Set MSRVTT_{split.upper()}_ANN_URL to a reachable link or configure Hugging Face Hub credentials and retry."
+                )
+
+    def _download_annotations_from_hf(self, split: str, filename: str, destination: Path) -> bool:
+        """Fallback: fetch annotation JSON via Hugging Face Hub if direct links fail."""
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            print("huggingface_hub not installed; skipping HF Hub fallback.")
+            return False
+
+        token = os.getenv('HF_TOKEN') or os.getenv('HUGGINGFACE_TOKEN') or os.getenv('HUGGINGFACEHUB_API_TOKEN')
+        repos = [repo for repo in self.annotation_hf_repos if repo]
+        last_error = None
+        local_path = None
+        for repo in repos:
+            try:
+                local_path = hf_hub_download(
+                    repo_id=repo,
+                    repo_type='dataset',
+                    filename=filename,
+                    token=token,
+                )
+                break
+            except Exception as exc:
+                print(f"Hugging Face Hub download failed for {split} annotations from {repo}: {exc}")
+                last_error = exc
+        if not local_path:
+            return False
+
+        try:
+            shutil.copy(local_path, destination)
+        except Exception as exc:
+            print(f"Failed to copy HF Hub {split} annotations to destination: {exc}")
+            return False
+
+        print(f"Downloaded {split} annotations via Hugging Face Hub.")
+        return True
+
+    def _copy_local_annotation(self, source_hint: Optional[str], filename: str, destination: Path) -> bool:
+        if not source_hint:
+            return False
+        source_path = Path(source_hint).expanduser()
+        if source_path.is_dir():
+            candidate = source_path / filename
+        else:
+            candidate = source_path
+        if not candidate.exists():
+            print(f"Local annotation source not found: {candidate}")
+            return False
+        try:
+            shutil.copy(candidate, destination)
+        except Exception as exc:
+            print(f"Failed to copy local annotation {candidate}: {exc}")
+            return False
+        print(f"Copied {filename} from local path {candidate}.")
+        return True
+
+    def _download_to_path(self, url: str, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            download_url(url=url, root=str(destination.parent), filename=destination.name)
+            return
+        except Exception as exc:
+            if destination.exists():
+                destination.unlink()
+            self._download_with_headers(url, destination, original_exc=exc)
+
+    def _download_with_headers(self, url: str, destination: Path, original_exc: Exception) -> None:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+        }
+        request = Request(url, headers=headers)
+        try:
+            with urlopen(request) as response, open(destination, 'wb') as fh:
+                shutil.copyfileobj(response, fh)
+        except Exception as exc:
+            if destination.exists():
+                destination.unlink()
+            raise exc from original_exc
+
+    def download_video_archives(self) -> None:
+        """Download MSRVTT video archives from direct HTTP sources when available."""
+
+        specs = [
+            ('train', self.train_folder, self.train_video_sources),
+            ('test', self.test_folder, self.test_video_sources),
+        ]
+
+        for split, target_folder, candidates in specs:
+            if target_folder.exists() and any(target_folder.glob('*.mp4')):
+                continue
+            target_folder.mkdir(parents=True, exist_ok=True)
+            success = False
+            expected_filename = None
+            for url, filename in candidates:
+                if not url:
+                    continue
+                expected_filename = expected_filename or filename
+                archive_path = self.dataset_folder / filename
+                extract_root = self.dataset_folder / f'_extracted_{split}'
+                if extract_root.exists():
+                    shutil.rmtree(extract_root, ignore_errors=True)
+                try:
+                    print(f"Downloading {split} archive from {url}...")
+                    download_url(url=url, root=str(self.dataset_folder), filename=filename)
+                    extract_archive(str(archive_path), str(extract_root))
+                    moved = self._move_extracted_videos(extract_root, target_folder)
+                    success = moved > 0
+                    if not success:
+                        print(f"No video files found in archive {filename}.")
+                except Exception as exc:
+                    print(f"Failed to download {split} archive from {url}: {exc}")
+                    success = False
+                finally:
+                    if archive_path.exists():
+                        try:
+                            archive_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                    if extract_root.exists():
+                        shutil.rmtree(extract_root, ignore_errors=True)
+                if success:
+                    break
+            if not success:
+                expected_filename = expected_filename or f"{split}_videos.zip"
+                success = self._download_archive_from_hf(split, expected_filename, target_folder)
+            if not success:
+                print(f"Unable to download {split} archive via configured mirrors or Hugging Face Hub."
+                      f" Set MSRVTT_{split.upper()}_ARCHIVE_URL or MSRVTT_ARCHIVE_REPO to override.")
+
+    def _move_extracted_videos(self, source_root: Path, target_folder: Path) -> int:
+        count = 0
+        if not source_root.exists():
+            return count
+        for video_file in source_root.rglob('*.mp4'):
+            destination = target_folder / video_file.name
+            if destination.exists():
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(video_file), str(destination))
+            count += 1
+        return count
+
+    def _download_archive_from_hf(self, split: str, filename: str, target_folder: Path) -> bool:
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            print("huggingface_hub not installed; skipping HF Hub fallback for archives.")
+            return False
+
+        token = os.getenv('HF_TOKEN') or os.getenv('HUGGINGFACE_TOKEN') or os.getenv('HUGGINGFACEHUB_API_TOKEN')
+        try:
+            local_path = hf_hub_download(
+                repo_id=self.video_archive_repo,
+                repo_type='dataset',
+                filename=filename,
+                token=token,
+            )
+        except Exception as exc:
+            print(f"Hugging Face Hub download failed for {split} archive: {exc}")
+            return False
+
+        temp_name = f"hf_{split}_{filename}"
+        temp_archive = self.dataset_folder / temp_name
+        try:
+            shutil.copy(local_path, temp_archive)
+        except Exception as exc:
+            print(f"Failed to copy HF Hub {split} archive to workspace: {exc}")
+            if temp_archive.exists():
+                try:
+                    temp_archive.unlink()
+                except FileNotFoundError:
+                    pass
+            return False
+
+        extract_root = self.dataset_folder / f'_extracted_{split}'
+        if extract_root.exists():
+            shutil.rmtree(extract_root, ignore_errors=True)
+        try:
+            extract_archive(str(temp_archive), str(extract_root))
+            moved = self._move_extracted_videos(extract_root, target_folder)
+            if moved == 0:
+                print(f"No video files found in HF Hub archive {filename}.")
+                return False
+        except Exception as exc:
+            print(f"Failed to extract HF Hub {split} archive {filename}: {exc}")
+            return False
+        finally:
+            if temp_archive.exists():
+                try:
+                    temp_archive.unlink()
+                except FileNotFoundError:
+                    pass
+            if extract_root.exists():
+                shutil.rmtree(extract_root, ignore_errors=True)
+
+        print(f"Downloaded {split} archive via Hugging Face Hub.")
+        return True
 
     def download_videos(self) -> None:
         '''
@@ -239,7 +486,13 @@ class MSRVTTDataset():
                     start_time = annotation['start time']
                     end_time = annotation['end time']
                     url = annotation['url']
-                    stat, is_available = self.download_video(video_id=video_id, start_time=start_time, end_time=end_time, url=url, download_folder=folder)
+                    stat, is_available = self.download_video(
+                        video_id=video_id,
+                        start_time=start_time,
+                        end_time=end_time,
+                        url=url,
+                        download_folder=folder,
+                    )
 
 
                     status.append({'video_id': video_id, 'start_time': start_time, 'end_time': end_time, 'status': stat, 'is_available': is_available, 'url': url})
@@ -249,7 +502,7 @@ class MSRVTTDataset():
                 json.dump(status, f)
 
     # download youtube videos start time to end time from id.
-    def download_video(self, video_id, start_time, end_time, url, download_folder) -> None:
+    def download_video(self, video_id: str, start_time: float, end_time: float, url: str, download_folder: Path) -> Tuple[str, bool]:
 
         '''
             Download youtube videos start time to end time from id.
@@ -257,12 +510,27 @@ class MSRVTTDataset():
 
         yt = YouTube(url)
         try:
-            download_video_path = download_folder / video_id
-            clipped_video_path = download_video_path.with_suffix('.mp4')
-            if not clipped_video_path.exists():
-                yt = yt.streams.filter(file_extension="mp4", resolution="360p").first().download(output_path=str(download_folder), filename=video_id)
-                clip_video(video_path=download_video_path, start_time=start_time, end_time=end_time, output_path=str(clipped_video_path))
-                download_video_path.unlink()
+            download_folder.mkdir(parents=True, exist_ok=True)
+            temp_basename = f"{video_id}_full"
+            temp_video_path = download_folder / f"{temp_basename}.mp4"
+            clipped_video_path = download_folder / f"{video_id}.mp4"
+            if clipped_video_path.exists():
+                print(f"Clip already exists: {clipped_video_path.name}")
+                stat = "Available"
+                return stat, True
+
+            stream = yt.streams.filter(file_extension="mp4", resolution="360p").first()
+            if stream is None:
+                stream = yt.streams.filter(file_extension="mp4").order_by('resolution').desc().first()
+            if stream is None:
+                print(f"No MP4 stream available: {video_id}")
+                stat = "No Stream"
+                return stat, False
+
+            stream.download(output_path=str(download_folder), filename=temp_basename)
+            clip_video(video_path=temp_video_path, start_time=start_time, end_time=end_time, output_path=str(clipped_video_path))
+            if temp_video_path.exists():
+                temp_video_path.unlink()
             print("Downloaded: " + video_id)
             stat = "Available"
             return stat, True
@@ -281,7 +549,8 @@ class MSRVTTDataset():
         except IncompleteRead:
             print("Incomplete Read: " + video_id)
             stat = "Incomplete Read Error"
-            download_video_path.unlink()
+            if temp_video_path.exists():
+                temp_video_path.unlink()
             return stat, False
         except av.error.ValueError:
             print("Value Error: " + video_id)
@@ -292,7 +561,12 @@ class MSRVTTDataset():
     
     def download_dataset(self) -> None:
         self.download_annotations()
-        self.download_videos()
+        self.download_video_archives()
+        train_missing = not (self.train_folder.exists() and any(self.train_folder.glob('*.mp4')))
+        test_missing = not (self.test_folder.exists() and any(self.test_folder.glob('*.mp4')))
+        if train_missing or test_missing:
+            print('Falling back to YouTube downloads for missing MSRVTT videos. This may take a long time.')
+            self.download_videos()
         self.update_annotations()
 
     def update_annotations(self) -> None:
