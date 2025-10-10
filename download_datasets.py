@@ -1,10 +1,5 @@
-from prepare_mscoco_dataset import MSCOCODataset
-from prepare_vizwiz_dataset import VizWizDataset
-from prepare_vatex_dataset import VatexDataset
+from prepare_msvd_dataset import MSVDDataset
+from prepare_msrvtt_dataset import MSRVTTDataset
 
-#dt = MSCOCODataset()
-#dt.download_dataset()
-#dt = VizWizDataset()
-#dt.download_dataset()
-dt = VatexDataset()
+dt = MSRVTTDataset()
 dt.download_dataset()
