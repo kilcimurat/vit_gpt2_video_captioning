@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -13,6 +13,11 @@ from tqdm.auto import tqdm
 
 from ..config import GenerationConfig, TrainingConfig
 from ..models.video_captioning import VideoCaptioningModel
+
+try:  # pragma: no cover - optional dependency for language metrics
+    import evaluate
+except ImportError:  # pragma: no cover - metrics remain disabled if unavailable
+    evaluate = None
 
 
 @dataclass
@@ -67,6 +72,22 @@ class Trainer:
             return self.model.module  # type: ignore[return-value]
         return self.model
 
+    def _build_generation_kwargs(self) -> Dict[str, Union[int, float]]:
+        """Create generation kwargs shared across evaluation helpers."""
+
+        kwargs: Dict[str, Union[int, float]] = {
+            "max_length": self.generation_cfg.max_length,
+            "num_beams": self.generation_cfg.num_beams,
+            "temperature": self.generation_cfg.temperature,
+        }
+        if self.tokenizer.pad_token_id is not None:
+            kwargs["pad_token_id"] = self.tokenizer.pad_token_id
+        if self.tokenizer.bos_token_id is not None:
+            kwargs["bos_token_id"] = self.tokenizer.bos_token_id
+        if self.tokenizer.eos_token_id is not None:
+            kwargs["eos_token_id"] = self.tokenizer.eos_token_id
+        return kwargs
+
     def _step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         pixel_values = batch["pixel_values"].to(self.device)
         input_ids = batch["input_ids"].to(self.device)
@@ -80,7 +101,10 @@ class Trainer:
                 attention_mask=attention_mask,
                 labels=labels,
             )
-            loss = outputs.loss / self.cfg.gradient_accumulation_steps
+            loss = outputs.loss
+            if isinstance(loss, torch.Tensor):
+                loss = loss.mean()
+            loss = loss / self.cfg.gradient_accumulation_steps
         return loss
 
     def _run_epoch(self, epoch: int) -> EpochResult:
@@ -149,7 +173,10 @@ class Trainer:
                     attention_mask=attention_mask,
                     labels=labels,
                 )
-                total_loss += outputs.loss.item()
+                loss = outputs.loss
+                if isinstance(loss, torch.Tensor):
+                    loss = loss.mean()
+                total_loss += loss.item()
                 progress.set_postfix(
                     {"loss": f"{total_loss / max(progress.n, 1):.4f}"},
                     refresh=False,
@@ -158,6 +185,113 @@ class Trainer:
         mean_loss = total_loss / max(len(self.val_loader), 1)
         perplexity = float(torch.exp(torch.tensor(mean_loss)))
         return EpochResult(loss=mean_loss, perplexity=perplexity)
+
+    def _collect_predictions(
+        self, epoch: int
+    ) -> Tuple[List[str], List[List[str]], List[Optional[str]]]:
+        if self.val_loader is None:
+            return [], [], []
+        dataset = getattr(self.val_loader, "dataset", None)
+        if dataset is None or not hasattr(dataset, "samples"):
+            return [], [], []
+
+        model = self._base_model()
+        model.eval()
+        generation_kwargs = self._build_generation_kwargs()
+
+        predictions: List[str] = []
+        references: List[List[str]] = []
+        video_paths: List[Optional[str]] = []
+
+        sample_offset = 0
+        with torch.no_grad():
+            progress = tqdm(
+                self.val_loader,
+                total=len(self.val_loader),
+                desc=f"Epoch {epoch} [gen]",
+                leave=False,
+            )
+            for batch in progress:
+                pixel_values = batch["pixel_values"].to(self.device)
+                generated = model.generate(pixel_values, generation_kwargs)
+                decoded = self.tokenizer.batch_decode(
+                    generated, skip_special_tokens=True
+                )
+                batch_size = len(decoded)
+
+                for idx_in_batch, pred in enumerate(decoded):
+                    dataset_index = sample_offset + idx_in_batch
+                    if dataset_index >= len(dataset.samples):
+                        continue
+                    sample = dataset.samples[dataset_index]
+                    predictions.append(pred.strip())
+                    references.append(
+                        [caption.strip() for caption in sample.get("captions", [])]
+                        or [""]
+                    )
+                    video_paths.append(sample.get("video_path"))
+
+                sample_offset += batch_size
+
+        return predictions, references, video_paths
+
+    def _compute_language_metrics(
+        self, predictions: List[str], references: List[List[str]]
+    ) -> Dict[str, float]:
+        if not predictions or not references or evaluate is None:
+            return {}
+
+        metrics: Dict[str, float] = {}
+
+        try:
+            bleu = evaluate.load("bleu")
+            bleu_result = bleu.compute(
+                predictions=predictions, references=references
+            )
+            precisions = bleu_result.get("precisions", [])
+            for n, score in enumerate(precisions, start=1):
+                metrics[f"bleu_{n}"] = float(score)
+        except Exception as exc:  # pragma: no cover - metric backend optional
+            print(f"[warn] BLEU metric unavailable: {exc}")
+
+        try:
+            cider = evaluate.load("cider")
+            cider_result = cider.compute(
+                predictions=predictions, references=references
+            )
+            metrics["cider"] = float(cider_result.get("cider", 0.0))
+        except Exception as exc:  # pragma: no cover
+            print(f"[warn] CIDEr metric unavailable: {exc}")
+
+        single_reference = [refs[0] if refs else "" for refs in references]
+        try:
+            meteor = evaluate.load("meteor")
+            meteor_result = meteor.compute(
+                predictions=predictions, references=single_reference
+            )
+            metrics["meteor"] = float(meteor_result.get("meteor", 0.0))
+        except Exception as exc:  # pragma: no cover
+            print(f"[warn] METEOR metric unavailable: {exc}")
+
+        try:
+            rouge = evaluate.load("rouge")
+            rouge_result = rouge.compute(
+                predictions=predictions, references=single_reference
+            )
+            metrics["rouge_l"] = float(rouge_result.get("rougeL", 0.0))
+        except Exception as exc:  # pragma: no cover
+            print(f"[warn] ROUGE-L metric unavailable: {exc}")
+
+        try:
+            spice = evaluate.load("spice")
+            spice_result = spice.compute(
+                predictions=predictions, references=references
+            )
+            metrics["spice"] = float(spice_result.get("spice", 0.0))
+        except Exception as exc:  # pragma: no cover
+            print(f"[warn] SPICE metric unavailable: {exc}")
+
+        return metrics
 
     def _save_checkpoint(self, epoch: int, metrics: Dict[str, float]) -> None:
         checkpoint_dir = self.output_dir / f"epoch_{epoch:03d}"
@@ -171,14 +305,7 @@ class Trainer:
         self.model.eval()
         with torch.no_grad():
             pixel_values = batch["pixel_values"][:2].to(self.device)
-            generation_kwargs = {
-                "max_length": self.generation_cfg.max_length,
-                "num_beams": self.generation_cfg.num_beams,
-                "temperature": self.generation_cfg.temperature,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "bos_token_id": self.tokenizer.bos_token_id,
-                "eos_token_id": self.tokenizer.eos_token_id,
-            }
+            generation_kwargs = self._build_generation_kwargs()
             generated = self._base_model().generate(pixel_values, generation_kwargs)
             captions = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
 
@@ -203,6 +330,13 @@ class Trainer:
                         "val_perplexity": val_metrics.perplexity,
                     }
                 )
+
+                if evaluate is not None:
+                    predictions, references, _ = self._collect_predictions(epoch)
+                    language_metrics = self._compute_language_metrics(
+                        predictions, references
+                    )
+                    metrics.update(language_metrics)
 
             print(f"Epoch {epoch} metrics: {metrics}")
             if epoch % self.cfg.save_every == 0:

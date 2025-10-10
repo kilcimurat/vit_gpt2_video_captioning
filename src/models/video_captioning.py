@@ -20,7 +20,9 @@ class VideoEncoder(nn.Module):
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
-        weights = ViT_B_16_Weights.IMAGENET1K_SWAG_E2E_V1
+        # Use ImageNet-pretrained weights that expect 224x224 inputs to match the
+        # default frame preprocessing in DatasetConfig.
+        weights = ViT_B_16_Weights.IMAGENET1K_V1
         self.backbone = vit_b_16(weights=weights)
         self.hidden_size = self.backbone.hidden_dim
         self.backbone.heads = nn.Identity()
@@ -31,9 +33,10 @@ class VideoEncoder(nn.Module):
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         batch, frames, channels, height, width = pixel_values.shape
         flattened = pixel_values.view(batch * frames, channels, height, width)
-        tokens = self.backbone._process_input(flattened)
-        encoded = self.backbone.encoder(tokens)
-        cls_tokens = encoded[:, 0, :]
+        # The ViT forward (with heads replaced by Identity) already returns the
+        # CLS embeddings, ensuring positional encodings and class token handling
+        # stay in sync with the pretrained configuration.
+        cls_tokens = self.backbone(flattened)
         return cls_tokens.view(batch, frames, -1)
 
 
